@@ -1,21 +1,64 @@
 # SC3020 Project 2
 
-Framework for comparing PostgreSQL-generated and AI-generated Query Execution Plans (QEPs).
+Compare PostgreSQL query execution plans (QEPs) with AI-generated plans.
 
-## Structure
-- `project.py`: application entry point
-- `preprocessing.py`: PostgreSQL and LLM plan retrieval/parsing
-- `comparison.py`: QEP tree comparison
-- `interface.py`: GUI and visualisation
-- `config/`: shared configuration
-- `data/`: dataset setup notes (do not commit generated datasets)
-- `tests/`: automated tests
-- `docs/`: setup, architecture and testing notes
+## Requirements
+
+- Python
+- PostgreSQL 17
+- Git LFS
+- TPC-H SF1 dataset
 
 ## Setup
-1. Create and activate a Python virtual environment.
-2. Install dependencies: `pip install -r requirements.txt`
-3. Copy `.env.example` to `.env` and fill in local credentials.
-4. Follow `docs/setup.md` for PostgreSQL and dataset setup.
 
-The application is a scaffold; implementation is still required.
+1. Clone the repository and download the LFS files:
+
+   ```bash
+   git lfs install
+   git lfs pull
+   ```
+
+2. Create a PostgreSQL database named `sc3020_project2`.
+
+3. Create the tables by running `database/schema.sql` in the database.
+
+4. Configure your database connection in `.env` using `.env.example` as a template.
+
+5. Install Python dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+6. Load the dataset:
+
+   ```bash
+   python database/load_tpch.py
+   ```
+
+7. Update PostgreSQL statistics:
+
+   ```sql
+   ANALYZE;
+   ```
+
+## Dataset
+
+- Dataset: TPC-H SF1
+- Database: PostgreSQL 17
+- Tables: 8
+- Indexes: Primary-key indexes only
+- Foreign keys: Defined in `database/schema.sql`
+
+The `data/` directory contains the eight TPC-H SF1 `.tbl` files, tracked with Git LFS.
+
+## Project Structure
+
+```text
+config/       Database configuration
+database/     Schema and dataset loader
+data/         TPC-H SF1 data
+src/          Project source code
+tests/        Tests
+docs/         Project documentation
+```
