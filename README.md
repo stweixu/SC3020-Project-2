@@ -30,17 +30,37 @@ Compare PostgreSQL query execution plans (QEPs) with AI-generated plans.
    pip install -r requirements.txt
    ```
 
-6. Load the dataset:
+6. Add your Gemini API key to `.env` as `LLM_API_KEY` to enable AI plan
+   generation. The model can be configured with `LLM_MODEL`.
+
+7. Load the dataset:
 
    ```bash
    python database/load_tpch.py
    ```
 
-7. Update PostgreSQL statistics:
+8. Update PostgreSQL statistics:
 
    ```sql
    ANALYZE;
    ```
+
+See [docs/ai-integration.md](docs/ai-integration.md) for the AI plan interface,
+schema context, and limitations.
+
+## Run the application
+
+After PostgreSQL retrieval, plan comparison, and display functions have been
+implemented, start the CLI workflow from the repository root:
+
+```bash
+python -m src.project
+```
+
+The entry point reads the TPC-H schema from `database/schema.sql`, prompts for
+SQL, and passes both plans and the comparison result through the project
+modules. Until the other team components are implemented, it reports which
+pipeline stage is still pending.
 
 ## Dataset
 
