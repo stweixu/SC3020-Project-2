@@ -20,7 +20,7 @@ from google.genai import types
 from src.plan_node import PlanNode
 
 
-DEFAULT_LLM_MODEL = "gemini-3.8-flash"
+DEFAULT_LLM_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_LLM_TIMEOUT_MS = 30000
 DEFAULT_LLM_RETRY_ATTEMPTS = 2
 MAX_PLAN_DEPTH = 64
