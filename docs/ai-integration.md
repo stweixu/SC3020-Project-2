@@ -30,7 +30,7 @@ cp .env.example .env
 
 Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/)
 and set it as `LLM_API_KEY` in `.env`. `LLM_MODEL` defaults to
-`gemini-3.8-flash`. The `.env` file is ignored by Git; do not commit or share
+`gemini-3.5-flash-lite`. The `.env` file is ignored by Git; do not commit or share
 your personal key. Gemini app or education access does not itself guarantee
 Gemini API quota or billing access.
 
