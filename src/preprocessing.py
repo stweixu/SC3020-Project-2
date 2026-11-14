@@ -69,6 +69,64 @@ def get_postgres_plan(sql):
 
 
 
+def get_database_context(conn=None):
+    """Read accessible user-schema columns, constraints and indexes as AI context.
+
+    No table contents are read. A supplied connection lets collection capture
+    context from the same database session as its run metadata.
+    """
+    if conn is None:
+        with psycopg.connect(**DB_CONFIG, connect_timeout=10) as connection:
+            connection.read_only = True
+            return get_database_context(connection)
+
+    def rows(sql):
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            names = [column.name for column in cur.description]
+            return [dict(zip(names, row)) for row in cur.fetchall()]
+
+    with conn.transaction():
+        conn.execute("SET LOCAL statement_timeout = '10s'")
+        context = rows("SELECT current_database() AS database, "
+                       "current_setting('search_path') AS search_path")[0]
+        context["columns"] = rows("""
+            SELECT n.nspname AS schema, c.relname AS relation, c.relkind AS kind,
+                   a.attname AS column, format_type(a.atttypid, a.atttypmod) AS type,
+                   a.attnotnull AS not_null
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_attribute a ON a.attrelid = c.oid
+            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND a.attnum > 0 AND NOT a.attisdropped
+              AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+              AND has_schema_privilege(n.oid, 'USAGE')
+              AND has_table_privilege(c.oid, 'SELECT')
+            ORDER BY n.nspname, c.relname, a.attnum
+        """)
+        context["constraints"] = rows("""
+            SELECT n.nspname AS schema, c.relname AS relation, k.conname AS name,
+                   pg_get_constraintdef(k.oid, true) AS definition
+            FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+              AND has_schema_privilege(n.oid, 'USAGE')
+              AND has_table_privilege(c.oid, 'SELECT')
+            ORDER BY n.nspname, c.relname, k.conname
+        """)
+        context["indexes"] = rows("""
+            SELECT n.nspname AS schema, c.relname AS relation, i.relname AS name,
+                   pg_get_indexdef(i.oid) AS definition
+            FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid
+            JOIN pg_class i ON i.oid = x.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+              AND has_schema_privilege(n.oid, 'USAGE')
+              AND has_table_privilege(c.oid, 'SELECT')
+            ORDER BY n.nspname, c.relname, i.relname
+        """)
+    return json.dumps(context, indent=2, ensure_ascii=False)
+
+
 def parse_postgres_plan(raw_plan):
     """
     Convert PostgreSQL's JSON execution plan into a PlanNode tree.

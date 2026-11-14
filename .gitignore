@@ -11,3 +11,5 @@ venv/
 Thumbs.db
 .pytest_cache/
 .coverage
+artifacts/plan_runs/
+artifacts/evaluations/

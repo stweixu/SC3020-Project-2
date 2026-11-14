@@ -50,17 +50,67 @@ schema context, and limitations.
 
 ## Run the application
 
-After PostgreSQL retrieval, plan comparison, and display functions have been
-implemented, start the CLI workflow from the repository root:
+Start the desktop interface from the repository root:
 
 ```bash
-python -m src.project
+python src/project.py
 ```
 
-The entry point reads the TPC-H schema from `database/schema.sql`, prompts for
-SQL, and passes both plans and the comparison result through the project
-modules. Until the other team components are implemented, it reports which
-pipeline stage is still pending.
+`python -m src.project` is also supported. The interface uses Tkinter, normally
+included with Python on Windows and macOS; check with `python -m tkinter`.
+
+- **PostgreSQL only** retrieves a real plan without an AI API key.
+- **PostgreSQL + AI** retrieves both plans using the configured Gemini account.
+- **Load demo** displays clearly labelled synthetic comparison data without
+  database or API access.
+
+AI context is read automatically from the connected database's accessible
+schemas, constraints and indexes. **AI schema context…** supplies an explicit
+override; leave it blank for automatic context. Connection settings come from
+`.env`. Live comparisons use Member 3's findings and the equal-weighted matched-node
+disagreement percentage. **Open saved result…** displays an evaluator pair JSON
+without another database/API request.
+
+See [docs/gui.md](docs/gui.md) for controls, the comparison-result
+format, verification steps, limitations, and development acknowledgement.
+
+## Evaluation query workload
+
+`tests/queries/` contains 20 custom TPC-H queries covering selections, joins,
+aggregation, ordering, subqueries, a materialized CTE, a set operation and a
+window function. `manifest.json` describes the purpose of each query.
+
+Validate all queries against your configured PostgreSQL database:
+
+```bash
+python tests/validate_workload.py
+```
+
+This retrieves estimated plans without executing the queries or calling the AI
+API. See [docs/testing.md](docs/testing.md) for coverage and evaluation guidance.
+
+Save replayable PostgreSQL plans and run configuration:
+
+```bash
+python tests/collect_plans.py
+```
+
+Each run is saved under `artifacts/plan_runs/` (ignored by Git). AI collection is
+optional via `--source ai` or `--source both` once API access is configured.
+Evaluate a saved collection containing both sources:
+
+```bash
+python tests/evaluate_plans.py artifacts/plan_runs/<run-id>
+```
+
+Results under `artifacts/evaluations/` include per-query CSV/Markdown tables,
+failure counts, main percentages and separate tree-edit distances. Replace
+`<run-id>` with the actual collection folder. Failed/missing pairs have no score.
+
+See [docs/comparison.md](docs/comparison.md) for Member 3's comparison algorithm,
+[docs/evaluation.md](docs/evaluation.md) for sampling, saved-record formats
+and the selected metric, and [docs/member4-progress.md](docs/member4-progress.md)
+for completed work and remaining dependencies.
 
 ## Dataset
 

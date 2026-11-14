@@ -1,90 +1,111 @@
-"""Main application orchestration and command-line entry point."""
+"""Application orchestration and desktop entry point."""
 
 from pathlib import Path
+import json
+import sys
 
-from src.comparison import compare_plans
+# Support both `python src/project.py` and `python -m src.project`.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.comparison import DIFFERENCE_RATE_VERSION, classify_comparison, compare_plans
 from src.interface import display_comparison
-from src.preprocessing import get_ai_plan, get_postgres_plan
+from src.preprocessing import (
+    AIPlanError, get_ai_plan, get_database_context, get_postgres_plan,
+    parse_ai_plan, parse_postgres_plan,
+)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "database" / "schema.sql"
-
-
-def run_query(sql, schema=None, *, display=True):
+def run_query(sql, schema=None, *, display=True, mode="both"):
     """Run the full QEP comparison workflow for one SQL query.
 
     Args:
         sql: SQL query entered by the user.
-        schema: Database schema context for the LLM. Defaults to the repository
-            TPC-H schema file.
+        schema: Database context for the LLM. If blank/None, inspect the connected
+            database's accessible schemas, constraints and indexes.
         display: If true, send the plans and comparison result to the UI layer.
+        mode: "postgres" retrieves only PostgreSQL; "both" also requests AI.
 
     Returns:
         A dictionary containing the PostgreSQL plan, AI plan, and comparison.
     """
     if not isinstance(sql, str) or not sql.strip():
         raise ValueError("Please provide a non-empty SQL query.")
+    if mode not in {"postgres", "both"}:
+        raise ValueError("mode must be 'postgres' or 'both'.")
 
-    if schema is None:
+    postgres_plan = parse_postgres_plan(get_postgres_plan(sql))
+    ai_plan = None
+    comparison_result = None
+    notice = "PostgreSQL plan loaded. AI generation and comparison were not requested."
+    if mode == "both":
         try:
-            schema = DEFAULT_SCHEMA_PATH.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise RuntimeError(
-                f"Could not read database schema at {DEFAULT_SCHEMA_PATH}: {exc}"
-            ) from exc
-
-    try:
-        postgres_plan = get_postgres_plan(sql)
-    except NotImplementedError as exc:
-        raise RuntimeError(
-            "PostgreSQL plan retrieval is not implemented yet; see Member 1's "
-            "get_postgres_plan(sql) task."
-        ) from exc
-
-    ai_plan = get_ai_plan(sql, schema)
-
-    try:
-        comparison_result = compare_plans(postgres_plan, ai_plan)
-    except NotImplementedError as exc:
-        raise RuntimeError(
-            "Plan comparison is not implemented yet; see Member 3's "
-            "compare_plans(postgres_plan, ai_plan) task."
-        ) from exc
+            if schema is None or (isinstance(schema, str) and not schema.strip()):
+                schema = get_database_context()
+            ai_plan = get_ai_plan(sql, schema)
+        except Exception as exc:
+            notice = f"PostgreSQL plan loaded; AI generation failed: {exc}"
+        else:
+            try:
+                comparison_result = compare_plans(postgres_plan, ai_plan)
+                comparison_result["metric"] = classify_comparison(comparison_result)
+                comparison_result["difference_rate"] = comparison_result["metric"]["difference_rate"]
+                notice = "Plans loaded. Comparison results are shown below."
+            except NotImplementedError:
+                notice = "Both plans loaded. Comparison is not implemented yet; colours and score are unavailable."
+            except Exception as exc:
+                comparison_result = None
+                notice = f"Both plans loaded; comparison failed: {exc}"
 
     if display:
-        try:
-            display_comparison(postgres_plan, ai_plan, comparison_result)
-        except NotImplementedError as exc:
-            raise RuntimeError(
-                "The comparison display is not implemented yet; see Member 4's "
-                "display_comparison(...) task."
-            ) from exc
+        display_comparison(postgres_plan, ai_plan, comparison_result, notice=notice)
 
     return {
         "postgres_plan": postgres_plan,
         "ai_plan": ai_plan,
         "comparison_result": comparison_result,
+        "notice": notice,
+    }
+
+
+def load_saved_comparison(path):
+    """Open one successful evaluator pair without database or provider requests."""
+    record = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or record.get("status") != "success":
+        raise ValueError("Choose a successful pair JSON from an evaluation's pairs folder.")
+    if (not isinstance(record.get("metric"), dict)
+            or record["metric"].get("method") != DIFFERENCE_RATE_VERSION):
+        raise ValueError("Saved metric version differs; evaluate the collection again.")
+    return {
+        "postgres_plan": parse_ai_plan(record["postgres_plan"]),
+        "ai_plan": parse_ai_plan(record["ai_plan"]),
+        "comparison_result": record["comparison_result"],
+        "sql": record["sql"],
+        "notice": f"SAVED RESULT — {record['query_id']}, repetition {record['repetition']}. "
+                  "Loaded offline from an evaluation record.",
     }
 
 
 def main():
-    """Prompt for SQL, run the pipeline, and report actionable errors."""
-    try:
-        sql = input("Enter SQL query: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("No query submitted.")
-        return 1
+    """Launch the GUI; live retrieval runs on its background worker."""
+    import tkinter as tk
 
-    if not sql:
-        print("Please enter a non-empty SQL query.")
-        return 1
+    from config.config import DB_CONFIG
+    from src.interface import ComparisonApp
 
-    try:
-        run_query(sql)
-    except Exception as exc:
-        print(f"Could not complete the QEP comparison: {exc}")
-        return 1
+    connection = (
+        f"Database: {DB_CONFIG.get('dbname') or '(not configured)'}  |  "
+        f"Host: {DB_CONFIG.get('host') or 'local'}:{DB_CONFIG['port']}  |  "
+        "Connection settings: .env (restart after changing)"
+    )
+    root = tk.Tk()
+    ComparisonApp(
+        root,
+        run_callback=lambda sql, context, mode: run_query(sql, context, display=False, mode=mode),
+        load_callback=load_saved_comparison,
+        connection_label=connection,
+    )
+    root.mainloop()
     return 0
 
 

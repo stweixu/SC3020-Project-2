@@ -1,10 +1,20 @@
 # Architecture
 
-Planned flow:
+Application flow:
 
 SQL query -> project.run_query -> preprocessing (PostgreSQL QEP + AI QEP) -> comparison -> interface
 
-`src/project.py` orchestrates the pipeline and defaults the AI schema context
-to `database/schema.sql`. Both QEPs use the common `PlanNode` representation
-from `src/plan_node.py` before comparison. PostgreSQL retrieval, comparison,
-and display functions are still implemented by their respective team members.
+`src/project.py` orchestrates retrieval, parsing, comparison and the main metric.
+Both QEPs use `PlanNode` from `src/plan_node.py`. Blank AI context is populated
+from the connected database; users may supply their own context instead.
+
+Member 3's comparator normalises and matches the plans without replacing the
+original displayed trees. Member 4's `classify_comparison()` validates that output
+and calculates the matched-node disagreement rate and colour classifications.
+`calculate_difference_rate()` exposes the percentage alone. The GUI uses the
+same classification rules. Tree-edit distance is a separate supporting measure.
+
+`tests/collect_plans.py` saves immutable experiment inputs. `tests/evaluate_plans.py`
+replays them offline, saves complete findings/counts and exports summary tables.
+The GUI can open the evaluator's saved pair records. See `comparison.md`,
+`evaluation.md` and `gui.md` for the contracts and limitations.

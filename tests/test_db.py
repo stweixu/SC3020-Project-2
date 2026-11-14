@@ -1,13 +1,8 @@
+"""Live connection smoke test using the application's configured database."""
 
 import psycopg
+from config.config import DB_CONFIG
 
-conn = psycopg.connect(
-    host="localhost",
-    port=5432,
-    dbname="sc3020_project2",
-    user="sc3020_project2"
-)
-
-print("Successfully connected to PostgreSQL!")
-
-conn.close()
+def test_database_connection():
+    with psycopg.connect(**DB_CONFIG, connect_timeout=10) as conn:
+        assert conn.execute("SELECT 1").fetchone() == (1,)

@@ -1,0 +1,131 @@
+{
+  "name": "Custom TPC-H plan-comparison workload",
+  "version": 1,
+  "dataset": "TPC-H SF1",
+  "schema": "database/schema.sql",
+  "index_assumption": "Primary-key indexes only; no secondary indexes",
+  "queries": [
+    {
+      "id": "Q01", "file": "Q01_primary_key_lookup.sql",
+      "category": "selection", "title": "Customer primary-key lookup",
+      "features": ["equality predicate", "primary key"],
+      "purpose": "Provide a selective indexed-access baseline. Check whether both plans use the available customer primary-key index."
+    },
+    {
+      "id": "Q02", "file": "Q02_narrow_key_range.sql",
+      "category": "selection", "title": "Narrow order-key range",
+      "features": ["range predicate", "primary key", "selectivity pair"],
+      "purpose": "Contrast with Q03 using identical projection and predicate shape but a much narrower key range.",
+      "paired_with": "Q03"
+    },
+    {
+      "id": "Q03", "file": "Q03_broad_key_range.sql",
+      "category": "selection", "title": "Broad order-key range",
+      "features": ["range predicate", "primary key", "selectivity pair"],
+      "purpose": "Contrast with Q02 to test whether the AI assumes indexed access regardless of estimated selectivity. An index exists but need not be selected.",
+      "paired_with": "Q02"
+    },
+    {
+      "id": "Q04", "file": "Q04_nonindexed_filters.sql",
+      "category": "selection", "title": "Combined non-indexed part filters",
+      "features": ["range predicate", "IN list", "LIKE", "conjunction"],
+      "purpose": "Exercise combined filters and check for AI proposals that rely on unavailable secondary indexes."
+    },
+    {
+      "id": "Q05", "file": "Q05_two_table_join.sql",
+      "category": "join", "title": "Customer/order join with selective filters",
+      "features": ["two-table inner join", "key range", "date range"],
+      "purpose": "Exercise join-method and input-side choices when a small customer range is joined to filtered orders."
+    },
+    {
+      "id": "Q06", "file": "Q06_three_table_join.sql",
+      "category": "join", "title": "Filtered customer/order/lineitem chain",
+      "features": ["three-table inner join", "join order", "multiple filters"],
+      "purpose": "Exercise alternative join orders and filter placement with conditions on all three relations."
+    },
+    {
+      "id": "Q07", "file": "Q07_four_table_join.sql",
+      "category": "join", "title": "Regional supplier inventory chain",
+      "features": ["four-table inner join", "join order", "different relation sizes"],
+      "purpose": "Exercise join order across region, nation, supplier and partsupp, including very small dimension tables."
+    },
+    {
+      "id": "Q08", "file": "Q08_grouped_aggregation.sql",
+      "category": "aggregation", "title": "Shipping-mode and return-flag totals",
+      "features": ["GROUP BY", "COUNT", "SUM", "AVG", "arithmetic expression"],
+      "purpose": "Exercise grouping strategy and possible partial/final aggregation or parallel-plan details."
+    },
+    {
+      "id": "Q09", "file": "Q09_having.sql",
+      "category": "aggregation", "title": "Supplier stock thresholds",
+      "features": ["GROUP BY", "HAVING", "pre-aggregation filter"],
+      "purpose": "Distinguish filtering input rows with WHERE from filtering aggregate results with HAVING."
+    },
+    {
+      "id": "Q10", "file": "Q10_top_n.sql",
+      "category": "ordering", "title": "Most expensive medium-sized parts",
+      "features": ["ORDER BY", "LIMIT", "multiple sort keys"],
+      "purpose": "Exercise ordering and limiting when the ordering columns do not have a matching index. Plain EXPLAIN does not confirm a runtime top-N sort algorithm."
+    },
+    {
+      "id": "Q11", "file": "Q11_distinct.sql",
+      "category": "aggregation", "title": "Distinct nation/segment combinations",
+      "features": ["DISTINCT", "multiple columns"],
+      "purpose": "Exercise duplicate elimination and possible hash-based versus sort-based strategies."
+    },
+    {
+      "id": "Q12", "file": "Q12_exists.sql",
+      "category": "subquery", "title": "Customers with qualifying monthly orders",
+      "features": ["EXISTS", "correlation", "semi-join semantics"],
+      "purpose": "Check how existence testing is represented, including optimizer rewrites that need not preserve the SQL subquery shape."
+    },
+    {
+      "id": "Q13", "file": "Q13_not_exists.sql",
+      "category": "subquery", "title": "Suppliers without critically low stock",
+      "features": ["NOT EXISTS", "correlation", "anti-join semantics"],
+      "purpose": "Exercise anti-join semantics without the NULL-sensitive behaviour of NOT IN."
+    },
+    {
+      "id": "Q14", "file": "Q14_scalar_subquery.sql",
+      "category": "subquery", "title": "Parts priced above a reference average",
+      "features": ["uncorrelated scalar subquery", "AVG", "repeated relation"],
+      "purpose": "Exercise an independently computed scalar aggregate and possible InitPlan representation."
+    },
+    {
+      "id": "Q15", "file": "Q15_correlated_subquery.sql",
+      "category": "subquery", "title": "Customers above their peer-group average",
+      "features": ["correlated scalar subquery", "AVG", "aliases"],
+      "purpose": "Exercise outer-variable references and possible repeated SubPlan evaluation. The outer key range bounds the number of candidate customers."
+    },
+    {
+      "id": "Q16", "file": "Q16_materialized_cte.sql",
+      "category": "cte", "title": "Materialized yearly customer totals",
+      "features": ["MATERIALIZED CTE", "aggregation", "join"],
+      "purpose": "Exercise explicit CTE materialisation, CTE scans and named intermediate results. MATERIALIZED is intentional, rather than relying on the optimizer to retain a plain CTE."
+    },
+    {
+      "id": "Q17", "file": "Q17_left_outer_join.sql",
+      "category": "join", "title": "Customer order counts including zero matches",
+      "features": ["LEFT JOIN", "ON-clause filter", "GROUP BY", "COUNT(column)"],
+      "purpose": "Check preservation of customers without matching orders. The date filter stays in ON, and COUNT(o_orderkey) yields zero for unmatched customers."
+    },
+    {
+      "id": "Q18", "file": "Q18_self_join.sql",
+      "category": "join", "title": "Supplier price comparisons for the same part",
+      "features": ["self-join", "aliases", "equality and inequality conditions"],
+      "purpose": "Exercise alias-aware matching for two scans of partsupp. The supplier inequality avoids self-pairs and symmetric duplicates."
+    },
+    {
+      "id": "Q19", "file": "Q19_union_all.sql",
+      "category": "set_operation", "title": "High-balance customer and supplier accounts",
+      "features": ["UNION ALL", "multiple branches", "constant projection"],
+      "purpose": "Exercise a branching append-style plan without requesting duplicate elimination."
+    },
+    {
+      "id": "Q20", "file": "Q20_window_function.sql",
+      "category": "window", "title": "Rank each customer's recent orders",
+      "features": ["ROW_NUMBER", "PARTITION BY", "window ordering"],
+      "purpose": "Exercise WindowAgg and required input ordering. Window ordering does not itself promise a globally ordered query result."
+    }
+  ]
+}
