@@ -47,7 +47,8 @@ Compare PostgreSQL query execution plans (QEPs) with AI-generated plans.
 
 See [docs/ai-integration.md](docs/ai-integration.md) for the AI plan interface,
 schema context, and limitations, and [docs/comparison.md](docs/comparison.md)
-for how the two plans are compared and the difference rate is calculated.
+for how the two plans are matched and compared and the `comparison_result`
+format.
 
 ## Run the application
 

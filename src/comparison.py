@@ -1,18 +1,31 @@
-"""Compare PostgreSQL and AI-generated QEP trees.
+"""Compare PostgreSQL and AI-generated QEP trees (Member 3).
 
-Member 3's component. ``compare_plans`` takes the PostgreSQL plan and the AI
-plan, normalises both into a common vocabulary, and returns a dictionary that
-the interface (Member 4) can display:
+Public functions
+----------------
+``match_nodes(postgres_plan, ai_plan)``
+    Pair up corresponding operators in the two plans.
+``identify_differences(postgres_plan, ai_plan)``
+    List scan-method, join-method, join-order, missing/additional operation
+    and other property differences, each with an explanation.
+``compare_plans(postgres_plan, ai_plan)``
+    Run both of the above and return the structured ``comparison_result``
+    consumed by Member 4's ``calculate_difference_rate`` and
+    ``display_comparison``.
 
-- a structural difference rate based on tree edit distance,
-- per-plan summaries (node counts, depth, operators, relations),
-- a list of human-readable differences (scan methods, join algorithms, join
-  order, aggregation/sorting operators, extra or missing operators),
-- a side-by-side comparison of row and cost estimates.
+All three accept either ``PlanNode`` trees or the raw plan JSON produced by
+``get_postgres_plan`` / ``get_ai_plan``. The difference *rate* is deliberately
+not computed here: that is Member 4's component. ``comparison_result`` exposes
+the counts it needs (matches, unmatched nodes, typed differences and a tree
+edit distance).
 
-PostgreSQL and the LLM name things differently (``Relation Name`` vs
-``relation_name``, ``Aggregate`` + ``Strategy: Hashed`` vs ``HashAggregate``),
-so every node is first mapped to a ``NormalizedNode``.
+Node IDs
+--------
+Every node is identified by its path in the ``PlanNode`` tree: the root is
+``"0"``, its children ``"0.0"``, ``"0.1"``, a grandchild ``"0.1.0"`` and so
+on. ``iter_plan_nodes`` yields the same IDs, so the GUI can colour the exact
+nodes referred to in matches and differences.
+
+See ``docs/comparison.md`` for the full result format.
 """
 
 import re
@@ -75,7 +88,7 @@ _OPERATOR_SYNONYMS = {
     "top-n sort": "Sort",
     "limit": "Limit",
     "unique": "Unique",
-    # Auxiliary / execution helpers
+    # Helpers
     "hash": "Hash",
     "materialize": "Materialize",
     "memoize": "Memoize",
@@ -98,8 +111,7 @@ _AGGREGATE_STRATEGIES = {
 
 _SCAN_OPERATORS = {
     "Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Heap Scan",
-    "Bitmap Index Scan", "Tid Scan", "Subquery Scan", "CTE Scan",
-    "Function Scan", "Values Scan",
+    "Tid Scan", "Subquery Scan", "CTE Scan", "Function Scan", "Values Scan",
 }
 _JOIN_OPERATORS = {"Hash Join", "Nested Loop", "Merge Join"}
 _AGGREGATE_OPERATORS = {
@@ -108,14 +120,15 @@ _AGGREGATE_OPERATORS = {
 }
 _SORT_OPERATORS = {"Sort", "Incremental Sort"}
 
-# Nodes PostgreSQL adds as execution helpers. An LLM usually omits them, so by
-# default they are removed before the structural comparison (their children
-# take their place) and reported separately.
+# Helper nodes PostgreSQL inserts as part of executing another operator. An
+# LLM usually leaves them out, so they are reported as their own difference
+# type ("auxiliary_operation") and excluded from the tree edit distance.
 AUXILIARY_OPERATORS = frozenset(
-    {"Hash", "Materialize", "Memoize", "Gather", "Gather Merge"}
+    {"Hash", "Materialize", "Memoize", "Gather", "Gather Merge",
+     "Bitmap Index Scan"}
 )
 
-# Property keys for each normalised field, PostgreSQL first, then AI.
+# Property keys for each field, PostgreSQL first, then AI.
 _RELATION_KEYS = ("Relation Name", "relation_name", "relation", "table")
 _ALIAS_KEYS = ("Alias", "alias")
 _INDEX_KEYS = ("Index Name", "index_name", "index")
@@ -124,6 +137,8 @@ _SCAN_TYPE_KEYS = ("scan_type",)
 _STRATEGY_KEYS = ("Strategy", "strategy")
 _ROWS_KEYS = ("Plan Rows", "estimated_rows", "rows")
 _COST_KEYS = ("Total Cost", "estimated_cost", "cost")
+_SORT_KEY_KEYS = ("Sort Key", "sort_key", "sort_keys")
+_GROUP_KEY_KEYS = ("Group Key", "group_key", "group_keys", "group_by")
 _CONDITION_KEYS = (
     "Hash Cond", "Merge Cond", "Join Filter", "Index Cond", "Recheck Cond",
     "Filter", "condition", "filter",
@@ -131,25 +146,135 @@ _CONDITION_KEYS = (
 
 
 # ---------------------------------------------------------------------------
+# Explanation text
+# ---------------------------------------------------------------------------
+
+_OPERATOR_DESCRIPTIONS = {
+    "Seq Scan": "reads every row of the table",
+    "Index Scan": "looks up matching rows through an index, then fetches them "
+                  "from the table",
+    "Index Only Scan": "answers the query from the index alone without "
+                       "visiting the table",
+    "Bitmap Heap Scan": "collects matching row locations from an index into "
+                        "a bitmap, then reads those table pages in order",
+    "Hash Join": "builds a hash table on one input and probes it with the "
+                 "other",
+    "Nested Loop": "scans the inner input once for every row of the outer "
+                   "input",
+    "Merge Join": "merges two inputs that are both sorted on the join key",
+    "Aggregate": "computes aggregates over all input rows as one group",
+    "HashAggregate": "groups rows using an in-memory hash table",
+    "GroupAggregate": "groups rows that arrive already sorted on the group "
+                      "key",
+    "MixedAggregate": "combines hashed and sorted grouping (e.g. for "
+                      "GROUPING SETS)",
+    "Sort": "sorts its input",
+    "Incremental Sort": "sorts input that is already partly sorted",
+    "Limit": "stops after the requested number of rows",
+    "Unique": "removes adjacent duplicate rows",
+    "Hash": "builds the hash table used by its parent Hash Join",
+    "Materialize": "caches its input in memory so it can be re-read",
+    "Memoize": "caches inner lookups of a Nested Loop by parameter value",
+    "Gather": "collects rows from parallel worker processes",
+    "Gather Merge": "collects sorted rows from parallel workers, keeping "
+                    "them in order",
+    "Bitmap Index Scan": "scans an index to build the bitmap for its parent "
+                         "Bitmap Heap Scan",
+}
+
+_TYPE_EXPLANATIONS = {
+    "scan_method": (
+        "The access method depends on how selective the predicate is, which "
+        "indexes exist and how large the table is. PostgreSQL decides using "
+        "statistics gathered by ANALYZE; the LLM has no statistics and has to "
+        "guess the selectivity."
+    ),
+    "join_method": (
+        "The join algorithm depends on the estimated input sizes, whether the "
+        "inputs are already sorted on the join key and whether an index exists "
+        "on the inner side. Different cardinality guesses lead to different "
+        "choices."
+    ),
+    "aggregate_method": (
+        "Hashed aggregation is usually chosen when the groups fit in memory; "
+        "sorted aggregation when the input is already sorted on the group key "
+        "or there are too many groups to hash."
+    ),
+    "sort_method": (
+        "An incremental sort can be used when the input is already sorted on a "
+        "prefix of the sort key."
+    ),
+    "join_order": (
+        "PostgreSQL searches join orders by estimating the size of each "
+        "intermediate result. A different order normally means the LLM "
+        "estimated those sizes differently."
+    ),
+    "join_input_order": (
+        "The same tables are joined, but the inputs are on different sides. "
+        "For a Hash Join this changes which table the hash table is built on; "
+        "for a Nested Loop it changes which table is the outer loop."
+    ),
+    "join_type": (
+        "A different logical join type (e.g. Semi vs Inner) suggests the "
+        "query, often an EXISTS/IN subquery, was interpreted differently. This "
+        "can change the query result, not just its performance."
+    ),
+    "index_used": (
+        "Both plans read the table through an index but chose different "
+        "indexes, so they assume different predicates are the most selective."
+    ),
+    "missing_operation": (
+        "PostgreSQL's plan contains a step the AI plan leaves out."
+    ),
+    "additional_operation": (
+        "The AI plan contains a step PostgreSQL's plan does not need."
+    ),
+    "auxiliary_operation": (
+        "This is an execution helper node rather than a separate logical "
+        "step, so the difference is usually one of presentation."
+    ),
+    "condition": (
+        "The predicate is placed or written differently. PostgreSQL may push "
+        "a filter into an index condition, or the AI may attach it to a "
+        "different node."
+    ),
+    "sort_key": "The two plans sort on different expressions or in a "
+                "different order.",
+    "group_key": "The two plans group on different columns.",
+}
+
+
+def _describe(operator):
+    description = _OPERATOR_DESCRIPTIONS.get(operator)
+    return f"{operator} ({description})" if description else operator
+
+
+# ---------------------------------------------------------------------------
 # Normalisation
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(eq=False)
 class NormalizedNode:
     """A plan node expressed in a vocabulary shared by both plan sources."""
 
+    node_id: str
     operator: str
     category: str
+    original_type: str
+    depth: int
     relation: str = None
     alias: str = None
     index: str = None
     join_type: str = None
     conditions: tuple = ()
+    sort_key: tuple = ()
+    group_key: tuple = ()
     rows: float = None
     cost: float = None
     children: list = field(default_factory=list)
-    original_type: str = None
+    relations: frozenset = frozenset()
+    plan_node: PlanNode = None
 
     def label(self):
         """Short text label, e.g. ``Seq Scan on orders``."""
@@ -157,11 +282,22 @@ class NormalizedNode:
             return f"{self.operator} on {self.relation}"
         return self.operator
 
+    def to_dict(self):
+        return {
+            "node_id": self.node_id,
+            "operator": self.operator,
+            "original_type": self.original_type,
+            "category": self.category,
+            "relation": self.relation,
+            "relations": sorted(self.relations),
+            "label": self.label(),
+        }
+
 
 def _first(properties, keys):
     for key in keys:
         value = properties.get(key)
-        if value not in (None, "", "null"):
+        if value not in (None, "", "null", []):
             return value
     return None
 
@@ -209,6 +345,8 @@ def _canonical_operator(node_type, properties):
 
 
 def _category(operator):
+    if operator in AUXILIARY_OPERATORS:
+        return "auxiliary"
     if operator in _SCAN_OPERATORS:
         return "scan"
     if operator in _JOIN_OPERATORS:
@@ -217,8 +355,6 @@ def _category(operator):
         return "aggregate"
     if operator in _SORT_OPERATORS:
         return "sort"
-    if operator in AUXILIARY_OPERATORS:
-        return "auxiliary"
     return "other"
 
 
@@ -237,7 +373,8 @@ def normalize_condition(condition):
     """Normalise a predicate so equivalent PostgreSQL/AI text compares equal.
 
     Removes type casts, quotes, parentheses, table/alias qualifiers and
-    whitespace differences, then sorts the sides of a simple equality.
+    whitespace differences, lower-cases everything and sorts the sides of
+    simple equalities and the terms of an AND.
     """
     if condition is None:
         return None
@@ -257,14 +394,23 @@ def normalize_condition(condition):
     return " and ".join(sorted(normalised_parts)) or None
 
 
+def _key_list(value):
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = value.split(",")
+    return tuple(k for k in (normalize_condition(v) for v in value) if k)
+
+
 def _coerce_plan(plan, source):
     """Accept a PlanNode, or raw PostgreSQL / AI JSON, and return a PlanNode."""
     if isinstance(plan, PlanNode):
         return plan
     if plan is None:
         raise ValueError(f"{source} plan is missing.")
+    # Lazy import: preprocessing pulls in psycopg and the Gemini SDK, which
+    # are not needed when PlanNode trees are passed in.
     if source == "PostgreSQL":
-        # Lazy import: preprocessing pulls in psycopg and the Gemini SDK.
         from src.preprocessing import parse_postgres_plan
 
         return parse_postgres_plan(plan)
@@ -273,51 +419,65 @@ def _coerce_plan(plan, source):
     return parse_ai_plan(plan)
 
 
-def normalize_plan(node, ignore_auxiliary=True):
-    """Convert a ``PlanNode`` tree into a list of ``NormalizedNode`` roots.
-
-    A list is returned because removing an auxiliary root (e.g. ``Gather``)
-    could in principle expose several children. Normally it has one item.
-    """
+def _normalize(node, node_id="0", depth=0):
     properties = node.properties or {}
     operator = _canonical_operator(node.node_type, properties)
-    children = []
-    for child in node.children or []:
-        children.extend(normalize_plan(child, ignore_auxiliary))
-
-    category = _category(operator)
-    if ignore_auxiliary and category == "auxiliary":
-        return children
-
-    conditions = []
-    for key in _CONDITION_KEYS:
-        value = properties.get(key)
-        if value not in (None, "", "null"):
-            conditions.append(normalize_condition(value))
-
-    return [
-        NormalizedNode(
-            operator=operator,
-            category=category,
-            relation=_clean_name(_first(properties, _RELATION_KEYS)),
-            alias=_clean_name(_first(properties, _ALIAS_KEYS)),
-            index=_clean_name(_first(properties, _INDEX_KEYS)),
-            join_type=_logical_join_type(_first(properties, _JOIN_TYPE_KEYS)),
-            conditions=tuple(sorted(c for c in conditions if c)),
-            rows=_to_number(_first(properties, _ROWS_KEYS)),
-            cost=_to_number(_first(properties, _COST_KEYS)),
-            children=children,
-            original_type=node.node_type,
-        )
+    children = [
+        _normalize(child, f"{node_id}.{i}", depth + 1)
+        for i, child in enumerate(node.children or [])
     ]
+    conditions = sorted(
+        c for c in (
+            normalize_condition(properties.get(key)) for key in _CONDITION_KEYS
+            if properties.get(key) not in (None, "", "null")
+        ) if c
+    )
+    normalized = NormalizedNode(
+        node_id=node_id,
+        operator=operator,
+        category=_category(operator),
+        original_type=node.node_type,
+        depth=depth,
+        relation=_clean_name(_first(properties, _RELATION_KEYS)),
+        alias=_clean_name(_first(properties, _ALIAS_KEYS)),
+        index=_clean_name(_first(properties, _INDEX_KEYS)),
+        join_type=_logical_join_type(_first(properties, _JOIN_TYPE_KEYS)),
+        conditions=tuple(conditions),
+        sort_key=_key_list(_first(properties, _SORT_KEY_KEYS)),
+        group_key=tuple(sorted(_key_list(_first(properties, _GROUP_KEY_KEYS)))),
+        rows=_to_number(_first(properties, _ROWS_KEYS)),
+        cost=_to_number(_first(properties, _COST_KEYS)),
+        children=children,
+        plan_node=node,
+    )
+    # A Bitmap Heap Scan's index name lives on its Bitmap Index Scan child.
+    if normalized.operator == "Bitmap Heap Scan" and not normalized.index:
+        normalized.index = next(
+            (c.index for c in children if c.operator == "Bitmap Index Scan"),
+            None,
+        )
+    relations = set()
+    if normalized.relation:
+        relations.add(normalized.relation)
+    for child in children:
+        relations |= child.relations
+    normalized.relations = frozenset(relations)
+    return normalized
 
 
-def _single_root(nodes, source):
-    if not nodes:
-        raise ValueError(f"{source} plan has no comparable operators.")
-    if len(nodes) == 1:
-        return nodes[0]
-    return NormalizedNode(operator="Result", category="other", children=nodes)
+def normalize_plan(plan, source="PostgreSQL"):
+    """Return the ``NormalizedNode`` root for a PlanNode tree or raw plan."""
+    return _normalize(_coerce_plan(plan, source))
+
+
+def iter_plan_nodes(plan, node_id="0"):
+    """Yield ``(node_id, PlanNode)`` pairs in pre-order.
+
+    The IDs are the ones used throughout ``comparison_result``.
+    """
+    yield node_id, plan
+    for i, child in enumerate(plan.children or []):
+        yield from iter_plan_nodes(child, f"{node_id}.{i}")
 
 
 # ---------------------------------------------------------------------------
@@ -335,28 +495,20 @@ def _depth(node):
     return 1 + max((_depth(child) for child in node.children), default=0)
 
 
-def _relations_under(node):
-    return frozenset(n.relation for n in _iter_nodes(node) if n.relation)
-
-
 def _join_tree(node):
     """Join order as nested tuples of relation names, e.g. ((a, b), c)."""
-    if node.category == "join":
-        parts = [_join_tree(child) for child in node.children]
-        parts = [p for p in parts if p is not None]
-        if not parts:
-            return None
-        return parts[0] if len(parts) == 1 else tuple(parts)
-    if node.relation and node.category == "scan":
+    if node.category == "scan" and node.relation:
         return node.relation
     parts = [p for p in (_join_tree(c) for c in node.children) if p is not None]
     if not parts:
         return None
-    return parts[0] if len(parts) == 1 else tuple(parts)
+    if len(parts) == 1:
+        return parts[0]
+    return tuple(parts)
 
 
 def _unordered(tree):
-    """Join tree with build/probe sides ignored, for order-insensitive equality."""
+    """Join tree with input sides ignored, for order-insensitive equality."""
     if isinstance(tree, tuple):
         return frozenset(_unordered(part) for part in tree)
     return tree
@@ -371,37 +523,46 @@ def format_join_tree(tree):
     return str(tree)
 
 
+def _top_join(root):
+    return next((n for n in _iter_nodes(root) if n.category == "join"), None)
+
+
+def _without_auxiliary(node):
+    """Copy of the tree with auxiliary nodes replaced by their children."""
+    children = []
+    for child in node.children:
+        children.extend(_without_auxiliary(child))
+    if node.category == "auxiliary":
+        return children
+    copy = NormalizedNode(**{**node.__dict__, "children": children})
+    return [copy]
+
+
 def summarize_plan(root):
-    """Return counts and lists describing one normalised plan."""
+    """Counts and lists describing one normalised plan."""
     nodes = list(_iter_nodes(root))
-    scans = [n for n in nodes if n.category == "scan"]
-    joins = [n for n in nodes if n.category == "join"]
     return {
         "node_count": len(nodes),
+        "auxiliary_node_count": sum(n.category == "auxiliary" for n in nodes),
         "depth": _depth(root),
-        "operators": dict(Counter(n.operator for n in nodes)),
-        "relations": sorted({n.relation for n in nodes if n.relation}),
-        "scan_count": len(scans),
-        "join_count": len(joins),
-        "join_order": format_join_tree(_join_tree(root)),
         "root_operator": root.operator,
+        "operators": dict(Counter(n.operator for n in nodes)),
+        "relations": sorted(root.relations),
+        "scan_count": sum(n.category == "scan" for n in nodes),
+        "join_count": sum(n.category == "join" for n in nodes),
+        "join_order": format_join_tree(_join_tree(root)),
         "estimated_rows": root.rows,
         "estimated_cost": root.cost,
     }
 
 
 # ---------------------------------------------------------------------------
-# Tree edit distance (Zhang–Shasha)
+# Tree edit distance (Zhang–Shasha) — structural measure for Member 4
 # ---------------------------------------------------------------------------
 
 
 def _rename_cost(a, b):
-    """Relabel cost.
-
-    0 for the same operator on the same relation, 0.5 for a different operator
-    of the same kind (e.g. Seq Scan vs Index Scan on one table, Hash Join vs
-    Merge Join), and 1 otherwise, including scans of different tables.
-    """
+    """0 same operator and relation; 0.5 same kind of operator; else 1."""
     if a.relation != b.relation and (a.relation or b.relation):
         return 1.0
     if a.operator == b.operator:
@@ -412,7 +573,12 @@ def _rename_cost(a, b):
 
 
 def tree_edit_distance(root_a, root_b):
-    """Ordered tree edit distance with unit insert/delete and graded relabel."""
+    """Ordered tree edit distance between two ``NormalizedNode`` trees.
+
+    Insert and delete cost 1. Relabelling costs 0 for the same operator on
+    the same relation, 0.5 for another operator of the same kind (Seq Scan vs
+    Index Scan on one table, Hash Join vs Merge Join) and 1 otherwise.
+    """
 
     def prepare(root):
         postorder, leftmost = [], []
@@ -429,8 +595,7 @@ def tree_edit_distance(root_a, root_b):
             return leftmost[index]
 
         walk(root)
-        keyroots = []
-        seen = set()
+        keyroots, seen = [], set()
         for i in range(len(postorder) - 1, -1, -1):
             if leftmost[i] not in seen:
                 seen.add(leftmost[i])
@@ -473,286 +638,384 @@ def tree_edit_distance(root_a, root_b):
 
 
 # ---------------------------------------------------------------------------
-# Detailed differences
+# Node matching
 # ---------------------------------------------------------------------------
 
 
-def _difference(category, description, postgres=None, ai=None):
-    return {
-        "category": category,
-        "description": description,
-        "postgres": postgres,
-        "ai": ai,
-    }
+def _jaccard(a, b):
+    if not a and not b:
+        return 1.0
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
 
 
-def _compare_scans(pg_root, ai_root):
-    differences = []
-    pg_scans = {}
-    ai_scans = {}
-    for node in _iter_nodes(pg_root):
-        if node.category == "scan" and node.relation:
-            pg_scans.setdefault(node.relation, []).append(node)
-    for node in _iter_nodes(ai_root):
-        if node.category == "scan" and node.relation:
-            ai_scans.setdefault(node.relation, []).append(node)
+def _match(pg_root, ai_root):
+    """Greedy relation-anchored matching between two normalised trees.
 
-    for relation in sorted(set(pg_scans) | set(ai_scans)):
-        pg_ops = sorted(n.operator for n in pg_scans.get(relation, []))
-        ai_ops = sorted(n.operator for n in ai_scans.get(relation, []))
-        if not ai_ops:
-            differences.append(_difference(
-                "scan",
-                f"PostgreSQL scans '{relation}' ({', '.join(pg_ops)}) but the "
-                "AI plan does not access it.",
-                pg_ops, None,
-            ))
-        elif not pg_ops:
-            differences.append(_difference(
-                "scan",
-                f"The AI plan scans '{relation}' ({', '.join(ai_ops)}) but "
-                "PostgreSQL does not access it.",
-                None, ai_ops,
-            ))
-        elif pg_ops != ai_ops:
-            differences.append(_difference(
-                "scan",
-                f"Different access method for '{relation}': PostgreSQL uses "
-                f"{', '.join(pg_ops)}, the AI plan uses {', '.join(ai_ops)}.",
-                pg_ops, ai_ops,
-            ))
+    Two nodes are candidates if they are the same kind of operator (both
+    scans, both joins, both aggregates, both sorts) and the sets of base
+    tables beneath them overlap. ``other`` and ``auxiliary`` nodes (Limit,
+    Unique, Hash, Gather, ...) must also have the same operator. Candidates
+    are ranked by:
+
+    1. Jaccard overlap of the table sets (1.0 = same tables),
+    2. same operator,
+    3. same alias (separates self-joins),
+    4. closest depth in the tree,
+
+    and taken greedily so each node is matched at most once.
+    """
+    pg_nodes = list(_iter_nodes(pg_root))
+    ai_nodes = list(_iter_nodes(ai_root))
+    candidates = []
+    for p in pg_nodes:
+        for a in ai_nodes:
+            if p.category != a.category:
+                continue
+            same_operator = p.operator == a.operator
+            if p.category in ("other", "auxiliary") and not same_operator:
+                continue
+            overlap = _jaccard(p.relations, a.relations)
+            if overlap == 0:
+                continue
+            same_alias = bool(p.alias) and p.alias == a.alias
+            score = (overlap, same_operator, same_alias, -abs(p.depth - a.depth))
+            candidates.append((score, p, a))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    used_pg, used_ai, pairs = set(), set(), []
+    for score, p, a in candidates:
+        if id(p) in used_pg or id(a) in used_ai:
+            continue
+        used_pg.add(id(p))
+        used_ai.add(id(a))
+        pairs.append((p, a, score[0]))
+
+    pairs.sort(key=lambda pair: [int(part) for part in pair[0].node_id.split(".")])
+    unmatched_pg = [n for n in pg_nodes if id(n) not in used_pg]
+    unmatched_ai = [n for n in ai_nodes if id(n) not in used_ai]
+    return pairs, unmatched_pg, unmatched_ai
+
+
+def _match_dict(pairs, unmatched_pg, unmatched_ai):
+    matches = []
+    for p, a, overlap in pairs:
+        if overlap == 1.0:
+            basis = ("same tables" if p.relations else "no tables (same operator)")
         else:
-            pg_index = sorted(filter(None, (n.index for n in pg_scans[relation])))
-            ai_index = sorted(filter(None, (n.index for n in ai_scans[relation])))
-            if pg_index and ai_index and pg_index != ai_index:
-                differences.append(_difference(
-                    "scan",
-                    f"Both plans use {pg_ops[0]} on '{relation}' but with "
-                    f"different indexes ({', '.join(pg_index)} vs "
-                    f"{', '.join(ai_index)}).",
-                    pg_index, ai_index,
-                ))
-    return differences
+            basis = f"overlapping tables ({overlap:.0%})"
+        matches.append({
+            "postgres": p.to_dict(),
+            "ai": a.to_dict(),
+            "category": p.category,
+            "same_operator": p.operator == a.operator,
+            "match_basis": basis,
+        })
+    return {
+        "matches": matches,
+        "unmatched_postgres": [n.to_dict() for n in unmatched_pg],
+        "unmatched_ai": [n.to_dict() for n in unmatched_ai],
+    }
 
 
-def _compare_joins(pg_root, ai_root):
+def match_nodes(postgres_plan, ai_plan):
+    """Identify corresponding nodes in the PostgreSQL and AI plans.
+
+    Args:
+        postgres_plan: ``PlanNode`` root or raw ``EXPLAIN (FORMAT JSON)``.
+        ai_plan: ``PlanNode`` root or raw AI JSON.
+
+    Returns:
+        ``{"matches": [...], "unmatched_postgres": [...],
+        "unmatched_ai": [...]}``. Each match is
+        ``{postgres, ai, category, same_operator, match_basis}`` where
+        ``postgres`` and ``ai`` are node dictionaries
+        ``{node_id, operator, original_type, category, relation, relations,
+        label}``. Unmatched lists contain node dictionaries.
+    """
+    pg_root = normalize_plan(postgres_plan, "PostgreSQL")
+    ai_root = normalize_plan(ai_plan, "AI")
+    return _match_dict(*_match(pg_root, ai_root))
+
+
+# ---------------------------------------------------------------------------
+# Difference detection
+# ---------------------------------------------------------------------------
+
+
+def _difference(diff_type, category, description, *, pg=None, ai=None,
+                postgres_value=None, ai_value=None, explanation=None):
+    return {
+        "type": diff_type,
+        "category": category,
+        "postgres_node_id": pg.node_id if pg else None,
+        "ai_node_id": ai.node_id if ai else None,
+        "postgres_value": postgres_value,
+        "ai_value": ai_value,
+        "description": description,
+        "explanation": explanation or _TYPE_EXPLANATIONS.get(diff_type, ""),
+    }
+
+
+_METHOD_TYPES = {
+    "scan": "scan_method",
+    "join": "join_method",
+    "aggregate": "aggregate_method",
+    "sort": "sort_method",
+}
+
+
+def _pair_differences(p, a):
     differences = []
-    pg_joins = {
-        _relations_under(n): n
-        for n in _iter_nodes(pg_root)
-        if n.category == "join"
-    }
-    ai_joins = {
-        _relations_under(n): n
-        for n in _iter_nodes(ai_root)
-        if n.category == "join"
-    }
+    where = f" on '{p.relation}'" if p.relation else ""
+    tables = ", ".join(sorted(p.relations))
 
-    for relations in sorted(set(pg_joins) & set(ai_joins), key=sorted):
-        pg_join, ai_join = pg_joins[relations], ai_joins[relations]
-        names = ", ".join(sorted(relations)) or "(no relations)"
-        if pg_join.operator != ai_join.operator:
-            differences.append(_difference(
-                "join",
-                f"Join of {{{names}}}: PostgreSQL uses {pg_join.operator}, "
-                f"the AI plan uses {ai_join.operator}.",
-                pg_join.operator, ai_join.operator,
-            ))
-        if (
-            pg_join.join_type
-            and ai_join.join_type
-            and pg_join.join_type != ai_join.join_type
-        ):
-            differences.append(_difference(
-                "join",
-                f"Join of {{{names}}}: logical join type differs "
-                f"({pg_join.join_type} vs {ai_join.join_type}).",
-                pg_join.join_type, ai_join.join_type,
-            ))
-
-    pg_tree, ai_tree = _join_tree(pg_root), _join_tree(ai_root)
-    if pg_joins or ai_joins:
-        if _unordered(pg_tree) != _unordered(ai_tree):
-            differences.append(_difference(
-                "join_order",
-                "Different join order: PostgreSQL joins "
-                f"{format_join_tree(pg_tree)}, the AI plan joins "
-                f"{format_join_tree(ai_tree)}.",
-                format_join_tree(pg_tree), format_join_tree(ai_tree),
-            ))
-        elif pg_tree != ai_tree:
-            differences.append(_difference(
-                "join_order",
-                "Same join grouping, but the inputs of at least one join are "
-                "swapped (e.g. a different hash build or outer side).",
-                format_join_tree(pg_tree), format_join_tree(ai_tree),
-            ))
-    return differences
-
-
-def _compare_operator_counts(pg_summary, ai_summary):
-    differences = []
-    pg_ops = Counter(pg_summary["operators"])
-    ai_ops = Counter(ai_summary["operators"])
-    for category, operators in (
-        ("aggregate", _AGGREGATE_OPERATORS),
-        ("sort", _SORT_OPERATORS),
-        ("other", None),
-    ):
-        relevant = sorted(
-            op for op in set(pg_ops) | set(ai_ops)
-            if (op in operators if operators else _category(op) == "other")
-        )
-        for operator in relevant:
-            if pg_ops[operator] != ai_ops[operator]:
-                differences.append(_difference(
-                    category,
-                    f"{operator}: {pg_ops[operator]} in PostgreSQL vs "
-                    f"{ai_ops[operator]} in the AI plan.",
-                    pg_ops[operator], ai_ops[operator],
-                ))
-    return differences
-
-
-def _compare_auxiliary(pg_full, ai_full):
-    pg_aux = Counter(
-        n.operator for n in _iter_nodes(pg_full) if n.category == "auxiliary"
-    )
-    ai_aux = Counter(
-        n.operator for n in _iter_nodes(ai_full) if n.category == "auxiliary"
-    )
-    differences = []
-    for operator in sorted(set(pg_aux) | set(ai_aux)):
-        if pg_aux[operator] != ai_aux[operator]:
-            differences.append(_difference(
-                "auxiliary",
-                f"{operator} (helper node, excluded from the difference rate): "
-                f"{pg_aux[operator]} in PostgreSQL vs {ai_aux[operator]} in the "
-                "AI plan.",
-                pg_aux[operator], ai_aux[operator],
-            ))
-    return differences
-
-
-def _estimate_row(label, pg_value, ai_value):
-    ratio = None
-    if pg_value and ai_value is not None:
-        ratio = round(ai_value / pg_value, 4)
-    return {"item": label, "postgres": pg_value, "ai": ai_value, "ai_to_postgres_ratio": ratio}
-
-
-def _compare_estimates(pg_root, ai_root):
-    rows = [
-        _estimate_row("Root estimated rows", pg_root.rows, ai_root.rows),
-        _estimate_row("Root estimated total cost", pg_root.cost, ai_root.cost),
-    ]
-    pg_scans = {
-        n.relation: n for n in _iter_nodes(pg_root)
-        if n.category == "scan" and n.relation
-    }
-    ai_scans = {
-        n.relation: n for n in _iter_nodes(ai_root)
-        if n.category == "scan" and n.relation
-    }
-    for relation in sorted(set(pg_scans) & set(ai_scans)):
-        rows.append(_estimate_row(
-            f"Rows from scan of {relation}",
-            pg_scans[relation].rows,
-            ai_scans[relation].rows,
+    if p.operator != a.operator:
+        diff_type = _METHOD_TYPES[p.category]
+        subject = (f"Access to '{p.relation}'" if p.category == "scan"
+                   else f"{p.category.capitalize()} over {{{tables}}}")
+        differences.append(_difference(
+            diff_type, p.category,
+            f"{subject}: PostgreSQL uses {p.operator}, the AI plan uses "
+            f"{a.operator}.",
+            pg=p, ai=a, postgres_value=p.operator, ai_value=a.operator,
+            explanation=(
+                f"PostgreSQL's {_describe(p.operator)}; the AI's "
+                f"{_describe(a.operator)}. {_TYPE_EXPLANATIONS[diff_type]}"
+            ),
         ))
+
+    if p.category == "join" and p.join_type and a.join_type \
+            and p.join_type != a.join_type:
+        differences.append(_difference(
+            "join_type", "join",
+            f"Join over {{{tables}}}: logical join type is {p.join_type} in "
+            f"PostgreSQL but {a.join_type} in the AI plan.",
+            pg=p, ai=a, postgres_value=p.join_type, ai_value=a.join_type,
+        ))
+
+    if p.index and a.index and p.index != a.index:
+        differences.append(_difference(
+            "index_used", p.category,
+            f"Different index{where}: PostgreSQL uses {p.index}, the AI plan "
+            f"uses {a.index}.",
+            pg=p, ai=a, postgres_value=p.index, ai_value=a.index,
+        ))
+
+    if p.conditions and a.conditions and set(p.conditions) != set(a.conditions):
+        differences.append(_difference(
+            "condition", p.category,
+            f"{p.label()}: conditions differ (PostgreSQL: "
+            f"{'; '.join(p.conditions)} | AI: {'; '.join(a.conditions)}).",
+            pg=p, ai=a, postgres_value=list(p.conditions),
+            ai_value=list(a.conditions),
+        ))
+
+    if p.sort_key and a.sort_key and p.sort_key != a.sort_key:
+        differences.append(_difference(
+            "sort_key", p.category,
+            f"{p.label()}: sort key is {', '.join(p.sort_key)} in PostgreSQL "
+            f"but {', '.join(a.sort_key)} in the AI plan.",
+            pg=p, ai=a, postgres_value=list(p.sort_key),
+            ai_value=list(a.sort_key),
+        ))
+
+    if p.group_key and a.group_key and p.group_key != a.group_key:
+        differences.append(_difference(
+            "group_key", p.category,
+            f"{p.label()}: group key is {', '.join(p.group_key)} in "
+            f"PostgreSQL but {', '.join(a.group_key)} in the AI plan.",
+            pg=p, ai=a, postgres_value=list(p.group_key),
+            ai_value=list(a.group_key),
+        ))
+    return differences
+
+
+def _unmatched_difference(node, side):
+    in_pg = side == "postgres"
+    plan_with, plan_without = (
+        ("PostgreSQL's plan", "the AI plan") if in_pg
+        else ("The AI plan", "PostgreSQL's plan")
+    )
+    if node.category == "auxiliary":
+        diff_type = "auxiliary_operation"
+    else:
+        diff_type = "missing_operation" if in_pg else "additional_operation"
+    tables = (f" over {{{', '.join(sorted(node.relations))}}}"
+              if node.relations and not node.relation else "")
+    description = (
+        f"{plan_with} has {node.label()}{tables} with no counterpart in "
+        f"{plan_without}."
+    )
+    if node.category == "scan" and node.relation:
+        description += (
+            f" '{node.relation}' is scanned fewer times, or not at all, in "
+            f"{plan_without}."
+        )
+    return _difference(
+        diff_type, node.category, description,
+        pg=node if in_pg else None, ai=None if in_pg else node,
+        postgres_value=node.operator if in_pg else None,
+        ai_value=None if in_pg else node.operator,
+        explanation=f"{_describe(node.operator)}. "
+                    f"{_TYPE_EXPLANATIONS[diff_type]}",
+    )
+
+
+def _join_order_differences(pg_root, ai_root):
+    pg_tree, ai_tree = _join_tree(pg_root), _join_tree(ai_root)
+    if not isinstance(pg_tree, tuple) and not isinstance(ai_tree, tuple):
+        return []
+    pg_join, ai_join = _top_join(pg_root), _top_join(ai_root)
+    if _unordered(pg_tree) != _unordered(ai_tree):
+        diff_type, description = "join_order", (
+            f"Different join order: PostgreSQL joins {format_join_tree(pg_tree)}, "
+            f"the AI plan joins {format_join_tree(ai_tree)}."
+        )
+    elif pg_tree != ai_tree:
+        diff_type, description = "join_input_order", (
+            "Same join grouping, but the inputs of at least one join are on "
+            f"opposite sides: PostgreSQL {format_join_tree(pg_tree)}, AI plan "
+            f"{format_join_tree(ai_tree)}."
+        )
+    else:
+        return []
+    return [_difference(
+        diff_type, "join", description, pg=pg_join, ai=ai_join,
+        postgres_value=format_join_tree(pg_tree),
+        ai_value=format_join_tree(ai_tree),
+    )]
+
+
+def _differences(pg_root, ai_root, pairs, unmatched_pg, unmatched_ai):
+    differences = []
+    for p, a, _ in pairs:
+        differences.extend(_pair_differences(p, a))
+    differences.extend(_join_order_differences(pg_root, ai_root))
+    differences.extend(_unmatched_difference(n, "postgres") for n in unmatched_pg)
+    differences.extend(_unmatched_difference(n, "ai") for n in unmatched_ai)
+    return differences
+
+
+def identify_differences(postgres_plan, ai_plan):
+    """Detect and explain the differences between the two plans.
+
+    Args:
+        postgres_plan: ``PlanNode`` root or raw ``EXPLAIN (FORMAT JSON)``.
+        ai_plan: ``PlanNode`` root or raw AI JSON.
+
+    Returns:
+        A list of difference dictionaries::
+
+            {
+                "type": "scan_method" | "join_method" | "aggregate_method"
+                        | "sort_method" | "join_order" | "join_input_order"
+                        | "join_type" | "index_used" | "condition"
+                        | "sort_key" | "group_key" | "missing_operation"
+                        | "additional_operation" | "auxiliary_operation",
+                "category": "scan" | "join" | "aggregate" | "sort"
+                            | "other" | "auxiliary",
+                "postgres_node_id": str | None,
+                "ai_node_id": str | None,
+                "postgres_value": ...,
+                "ai_value": ...,
+                "description": str,   # what differs
+                "explanation": str,   # why it may differ / what it means
+            }
+    """
+    pg_root = normalize_plan(postgres_plan, "PostgreSQL")
+    ai_root = normalize_plan(ai_plan, "AI")
+    return _differences(pg_root, ai_root, *_match(pg_root, ai_root))
+
+
+# ---------------------------------------------------------------------------
+# Full comparison
+# ---------------------------------------------------------------------------
+
+
+def _estimates(pairs):
+    rows = []
+    for p, a, _ in pairs:
+        if p.rows is None and p.cost is None and a.rows is None and a.cost is None:
+            continue
+        rows.append({
+            "postgres_node_id": p.node_id,
+            "ai_node_id": a.node_id,
+            "label": p.label(),
+            "postgres_rows": p.rows,
+            "ai_rows": a.rows,
+            "postgres_cost": p.cost,
+            "ai_cost": a.cost,
+        })
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
-def compare_plans(postgres_plan, ai_plan, *, ignore_auxiliary=True):
+def compare_plans(postgres_plan, ai_plan):
     """Compare a PostgreSQL QEP with an AI-generated QEP.
 
     Args:
-        postgres_plan: ``PlanNode`` root, or the raw ``EXPLAIN (FORMAT JSON)``
+        postgres_plan: ``PlanNode`` root or the raw ``EXPLAIN (FORMAT JSON)``
             output returned by ``get_postgres_plan``.
-        ai_plan: ``PlanNode`` root, or raw AI JSON accepted by
+        ai_plan: ``PlanNode`` root or raw AI JSON accepted by
             ``parse_ai_plan``.
-        ignore_auxiliary: If true, PostgreSQL helper nodes (Hash, Materialize,
-            Memoize, Gather, Gather Merge) are excluded from the structural
-            score and reported separately.
 
     Returns:
-        A dictionary with keys:
+        ``comparison_result`` dictionary::
 
-        - ``difference_rate``: 0.0 (identical) to 1.0 (completely different),
-          the tree edit distance divided by the larger plan's node count.
-        - ``similarity``: ``1 - difference_rate``.
-        - ``tree_edit_distance``: raw edit distance.
-        - ``identical_structure``: true when the edit distance is zero.
-        - ``postgres_summary`` / ``ai_summary``: see ``summarize_plan``.
-        - ``differences``: list of ``{category, description, postgres, ai}``.
-        - ``estimates``: row/cost estimates side by side.
-        - ``notes``: caveats to show alongside the result.
+            {
+                "matches": [...],              # see match_nodes
+                "unmatched_postgres": [...],
+                "unmatched_ai": [...],
+                "differences": [...],          # see identify_differences
+                "difference_counts": {type: count},
+                "tree_edit_distance": float,   # helper nodes excluded
+                "postgres_summary": {...},     # see summarize_plan
+                "ai_summary": {...},
+                "estimates": [...],            # rows/cost of matched nodes
+                "identical": bool,
+                "notes": [str, ...],
+            }
+
+        The difference rate is computed from this result by Member 4's
+        ``calculate_difference_rate``.
     """
-    pg_node = _coerce_plan(postgres_plan, "PostgreSQL")
-    ai_node = _coerce_plan(ai_plan, "AI")
+    pg_root = normalize_plan(postgres_plan, "PostgreSQL")
+    ai_root = normalize_plan(ai_plan, "AI")
 
-    pg_root = _single_root(normalize_plan(pg_node, ignore_auxiliary), "PostgreSQL")
-    ai_root = _single_root(normalize_plan(ai_node, ignore_auxiliary), "AI")
+    pairs, unmatched_pg, unmatched_ai = _match(pg_root, ai_root)
+    differences = _differences(pg_root, ai_root, pairs, unmatched_pg, unmatched_ai)
 
-    pg_summary = summarize_plan(pg_root)
-    ai_summary = summarize_plan(ai_root)
+    pg_core = _without_auxiliary(pg_root)
+    ai_core = _without_auxiliary(ai_root)
+    if len(pg_core) == 1 and len(ai_core) == 1:
+        distance = tree_edit_distance(pg_core[0], ai_core[0])
+    else:  # a plan made only of helper nodes; fall back to the full trees
+        distance = tree_edit_distance(pg_root, ai_root)
 
-    distance = tree_edit_distance(pg_root, ai_root)
-    largest = max(pg_summary["node_count"], ai_summary["node_count"])
-    difference_rate = min(1.0, distance / largest) if largest else 0.0
-
-    differences = []
-    if pg_root.operator != ai_root.operator:
-        differences.append(_difference(
-            "root",
-            f"Root operator differs: PostgreSQL {pg_root.operator}, AI "
-            f"plan {ai_root.operator}.",
-            pg_root.operator, ai_root.operator,
-        ))
-    differences.extend(_compare_scans(pg_root, ai_root))
-    differences.extend(_compare_joins(pg_root, ai_root))
-    differences.extend(_compare_operator_counts(pg_summary, ai_summary))
-    if ignore_auxiliary:
-        pg_full = _single_root(normalize_plan(pg_node, False), "PostgreSQL")
-        ai_full = _single_root(normalize_plan(ai_node, False), "AI")
-        differences.extend(_compare_auxiliary(pg_full, ai_full))
-
-    notes = [
-        "The AI plan is a proposed plan; it is not executed and its row and "
-        "cost estimates are not based on PostgreSQL statistics.",
-    ]
-    if ignore_auxiliary:
-        notes.append(
-            "Helper nodes (Hash, Materialize, Memoize, Gather, Gather Merge) "
-            "are excluded from the difference rate."
-        )
-
-    return {
-        "difference_rate": round(difference_rate, 4),
-        "similarity": round(1.0 - difference_rate, 4),
-        "tree_edit_distance": distance,
-        "identical_structure": distance == 0,
-        "postgres_summary": pg_summary,
-        "ai_summary": ai_summary,
+    result = _match_dict(pairs, unmatched_pg, unmatched_ai)
+    result.update({
         "differences": differences,
-        "estimates": _compare_estimates(pg_root, ai_root),
-        "notes": notes,
-    }
+        "difference_counts": dict(Counter(d["type"] for d in differences)),
+        "tree_edit_distance": distance,
+        "postgres_summary": summarize_plan(pg_root),
+        "ai_summary": summarize_plan(ai_root),
+        "estimates": _estimates(pairs),
+        "identical": not differences,
+        "notes": [
+            "The AI plan is a proposed plan; it is not executed and its row "
+            "and cost estimates are not based on PostgreSQL statistics.",
+            "Helper nodes (Hash, Materialize, Memoize, Gather, Gather Merge, "
+            "Bitmap Index Scan) are reported as auxiliary_operation and "
+            "excluded from tree_edit_distance.",
+        ],
+    })
+    return result
 
 
 def format_comparison(result):
     """Render a ``compare_plans`` result as plain text (CLI / debugging)."""
     pg, ai = result["postgres_summary"], result["ai_summary"]
     lines = [
-        f"Difference rate: {result['difference_rate']:.1%} "
-        f"(similarity {result['similarity']:.1%}, "
-        f"tree edit distance {result['tree_edit_distance']:g})",
-        "",
         f"{'':<16}{'PostgreSQL':<36}AI",
         f"{'Nodes':<16}{pg['node_count']:<36}{ai['node_count']}",
         f"{'Depth':<16}{pg['depth']:<36}{ai['depth']}",
@@ -760,16 +1023,27 @@ def format_comparison(result):
         f"{'Joins':<16}{pg['join_count']:<36}{ai['join_count']}",
         f"{'Join order':<16}{pg['join_order']:<36}{ai['join_order']}",
         "",
-        "Differences:",
+        f"Matched nodes: {len(result['matches'])}  |  only in PostgreSQL: "
+        f"{len(result['unmatched_postgres'])}  |  only in AI: "
+        f"{len(result['unmatched_ai'])}  |  tree edit distance: "
+        f"{result['tree_edit_distance']:g}",
+        "",
+        "Matches:",
     ]
+    for m in result["matches"]:
+        mark = "=" if m["same_operator"] else "≠"
+        lines.append(
+            f"  [{m['postgres']['node_id']}] {m['postgres']['label']}  {mark}  "
+            f"[{m['ai']['node_id']}] {m['ai']['label']}"
+        )
+    lines.append("")
+    lines.append("Differences:")
     if result["differences"]:
-        lines.extend(f"  - [{d['category']}] {d['description']}" for d in result["differences"])
+        for d in result["differences"]:
+            lines.append(f"  - [{d['type']}] {d['description']}")
+            lines.append(f"      Why: {d['explanation']}")
     else:
         lines.append("  (none)")
-    lines.append("")
-    lines.append("Estimates:")
-    for row in result["estimates"]:
-        lines.append(f"  - {row['item']}: PostgreSQL {row['postgres']}, AI {row['ai']}")
     lines.append("")
     lines.extend(f"Note: {note}" for note in result["notes"])
     return "\n".join(lines)

@@ -1,89 +1,167 @@
-# QEP comparison
+# QEP comparison (Member 3)
 
-Member 3's component lives in `src/comparison.py`.
+Implemented in `src/comparison.py`. Tests: `tests/test_comparison.py`
+(`python -m pytest tests/test_comparison.py`; no database or API key needed).
 
-## Interface
+## Functions
 
-```python
-from src.comparison import compare_plans, format_comparison
+| Function | Input | Output |
+| --- | --- | --- |
+| `compare_plans(postgres_plan, ai_plan)` | both plans | `comparison_result` dictionary (below) |
+| `match_nodes(postgres_plan, ai_plan)` | both plans | `{matches, unmatched_postgres, unmatched_ai}` |
+| `identify_differences(postgres_plan, ai_plan)` | both plans | list of difference dictionaries |
+| `iter_plan_nodes(plan)` | a `PlanNode` | `(node_id, PlanNode)` pairs, for the GUI |
+| `format_comparison(result)` | `comparison_result` | plain-text report |
 
-result = compare_plans(postgres_plan, ai_plan)
-print(format_comparison(result))
-```
+**Inputs.** `postgres_plan` may be the `PlanNode` from `parse_postgres_plan`
+or the raw `EXPLAIN (FORMAT JSON)` output from `get_postgres_plan`. `ai_plan`
+may be the `PlanNode` from `get_ai_plan` or raw AI JSON. Raw input is converted
+with Member 1's and Member 2's parsers. The input plans are never modified.
 
-- `postgres_plan`: a `PlanNode` from `parse_postgres_plan`, or the raw
-  `EXPLAIN (FORMAT JSON)` output from `get_postgres_plan` (converted
-  automatically).
-- `ai_plan`: a `PlanNode` from `get_ai_plan`, or raw AI JSON (converted with
-  `parse_ai_plan`).
-- `ignore_auxiliary` (keyword, default `True`): see below.
+**Node IDs.** A node is identified by its path in the `PlanNode` tree: root
+`"0"`, its children `"0.0"`, `"0.1"`, grandchild `"0.1.0"`. `iter_plan_nodes`
+produces the same IDs, so `display_comparison` can colour the nodes named in
+matches and differences.
 
-## Normalisation
+## Approach
 
-PostgreSQL and the LLM use different property keys and operator names, so both
-trees are mapped to a shared vocabulary before comparison:
+### 1. Normalisation
+
+PostgreSQL and the LLM name things differently, so each node is first mapped
+to a shared vocabulary:
 
 | Field | PostgreSQL key | AI key |
 | --- | --- | --- |
-| Relation | `Relation Name` | `relation_name` |
+| Table | `Relation Name` | `relation_name` |
+| Alias | `Alias` | `alias` |
 | Logical join type | `Join Type` | `join_type` |
-| Condition | `Hash Cond`, `Index Cond`, `Filter`, ... | `condition` |
-| Rows | `Plan Rows` | `estimated_rows` |
-| Cost | `Total Cost` | `estimated_cost` |
+| Conditions | `Hash Cond`, `Merge Cond`, `Join Filter`, `Index Cond`, `Filter`, ... | `condition` |
+| Index | `Index Name` | `index_name` |
+| Sort / group key | `Sort Key`, `Group Key` | `sort_key`, `group_key` |
+| Rows / cost | `Plan Rows`, `Total Cost` | `estimated_rows`, `estimated_cost` |
 
 Operator synonyms are unified ("Sequential Scan" becomes `Seq Scan`, "Nested
 Loop Join" becomes `Nested Loop`). PostgreSQL's `Aggregate` node with
-`Strategy: Hashed`/`Sorted` becomes `HashAggregate`/`GroupAggregate` to match
-the names an LLM typically uses. Generic AI nodes such as `Scan` with a
-`scan_type` property are resolved to the specific scan.
+`Strategy: Hashed`/`Sorted` becomes `HashAggregate`/`GroupAggregate`. A generic
+AI `Scan` node with a `scan_type` property is resolved to the specific scan.
+Conditions are compared after removing casts, quotes, parentheses and table
+qualifiers, so `((c.c_mktsegment)::text = 'BUILDING'::text)` equals
+`c_mktsegment = 'building'`.
 
-PostgreSQL adds helper nodes (`Hash`, `Materialize`, `Memoize`, `Gather`,
-`Gather Merge`) that an LLM usually leaves out. By default they are removed
-before the structural comparison (their children take their place) and any
-difference in them is reported in the `auxiliary` category.
+Each operator is assigned a category: `scan`, `join`, `aggregate`, `sort`,
+`auxiliary` (PostgreSQL helper nodes: `Hash`, `Materialize`, `Memoize`,
+`Gather`, `Gather Merge`, `Bitmap Index Scan`) or `other` (`Limit`, `Unique`,
+...).
 
-## Difference rate
+### 2. Node matching (`match_nodes`)
 
-`difference_rate = tree_edit_distance / max(node_count_pg, node_count_ai)`,
-capped at 1.0. The tree edit distance is the ordered Zhang–Shasha algorithm
-with:
+Ordered tree edit distance alone is a poor matcher for QEPs: swapping a join's
+two inputs, which changes little logically, shows up as two relabels. Matching
+is therefore anchored on the base tables underneath each node:
 
-- insert / delete: 1
-- relabel to the same operator on the same relation: 0
-- relabel to another operator of the same kind (Seq Scan vs Index Scan on one
-  table, Hash Join vs Merge Join, HashAggregate vs GroupAggregate): 0.5
-- any other relabel, including a scan of a different table: 1
+1. For every node, collect the set of tables in its subtree.
+2. Two nodes are candidates if they are in the same category and their table
+   sets overlap. `other` and `auxiliary` nodes must also have the same
+   operator.
+3. Candidates are ranked by Jaccard overlap of the table sets (1.0 means same
+   tables), then same operator, then same alias (separates self-joins such as
+   `nation n1`/`nation n2`), then closest depth.
+4. Pairs are taken greedily in that order, each node at most once.
 
-The distance is ordered, so swapping a join's inputs (a different hash build or
-outer side) counts as a difference. The `join_order` entry in `differences`
-states whether the join grouping itself differs or only the input sides do.
+A matched pair with different operators (Seq Scan ↔ Index Scan) is a method
+difference. An unmatched node is a missing or additional operation.
 
-## Result
+### 3. Difference detection (`identify_differences`)
 
-```text
-difference_rate      float, 0.0 identical .. 1.0 completely different
-similarity           1 - difference_rate
-tree_edit_distance   float
-identical_structure  bool
-postgres_summary     node_count, depth, operators, relations, scan_count,
-ai_summary           join_count, join_order, root_operator,
-                     estimated_rows, estimated_cost
-differences          list of {category, description, postgres, ai}
-estimates            list of {item, postgres, ai, ai_to_postgres_ratio}
-notes                list of caveats to display with the result
+| `type` | Detected when |
+| --- | --- |
+| `scan_method` | matched scans use different access methods |
+| `join_method` | matched joins use different algorithms |
+| `aggregate_method` | matched aggregates differ (e.g. HashAggregate vs GroupAggregate) |
+| `sort_method` | Sort vs Incremental Sort |
+| `join_order` | the join trees group the tables differently |
+| `join_input_order` | same grouping, but a join's inputs are on opposite sides |
+| `join_type` | matched joins have different logical types (Inner vs Semi, ...) |
+| `index_used` | matched scans use different indexes |
+| `condition` | matched nodes both have conditions and they differ |
+| `sort_key` / `group_key` | matched nodes both have keys and they differ |
+| `missing_operation` | a PostgreSQL node has no counterpart in the AI plan |
+| `additional_operation` | an AI node has no counterpart in PostgreSQL's plan |
+| `auxiliary_operation` | an unmatched helper node (either plan) |
+
+Property differences are reported only when both plans state the property,
+because the LLM often leaves fields empty.
+
+Each difference carries a `description` (what differs) and an `explanation`
+(what the operators do and why a planner might choose differently).
+
+### 4. Tree edit distance
+
+`compare_plans` also returns a Zhang–Shasha ordered tree edit distance between
+the two trees with helper nodes removed. Insert and delete cost 1; relabelling
+costs 0 for the same operator on the same table, 0.5 for another operator of
+the same kind on the same table, and 1 otherwise. This is a structural measure
+Member 4 can use; the difference rate itself is Member 4's
+`calculate_difference_rate(comparison_result)`.
+
+## `comparison_result` format
+
+```python
+{
+    "matches": [
+        {
+            "postgres": NODE, "ai": NODE,
+            "category": "scan" | "join" | "aggregate" | "sort" | "other" | "auxiliary",
+            "same_operator": bool,
+            "match_basis": "same tables" | "overlapping tables (67%)" | ...,
+        },
+    ],
+    "unmatched_postgres": [NODE, ...],
+    "unmatched_ai": [NODE, ...],
+    "differences": [
+        {
+            "type": "scan_method" | ... (table above),
+            "category": "scan" | "join" | "aggregate" | "sort" | "other" | "auxiliary",
+            "postgres_node_id": "0.1" | None,
+            "ai_node_id": "0.0" | None,
+            "postgres_value": ..., "ai_value": ...,
+            "description": str,
+            "explanation": str,
+        },
+    ],
+    "difference_counts": {"scan_method": 1, ...},
+    "tree_edit_distance": float,
+    "postgres_summary": SUMMARY,
+    "ai_summary": SUMMARY,
+    "estimates": [
+        {"postgres_node_id", "ai_node_id", "label",
+         "postgres_rows", "ai_rows", "postgres_cost", "ai_cost"},
+    ],
+    "identical": bool,          # no differences at all
+    "notes": [str, ...],
+}
+
+NODE = {"node_id", "operator", "original_type", "category",
+        "relation", "relations", "label"}
+
+SUMMARY = {"node_count", "auxiliary_node_count", "depth", "root_operator",
+           "operators", "relations", "scan_count", "join_count",
+           "join_order", "estimated_rows", "estimated_cost"}
 ```
 
-`differences` categories are `root`, `scan`, `join`, `join_order`,
-`aggregate`, `sort`, `other`, and `auxiliary`. Joins are matched between the
-plans by the set of relations underneath them, so a join of `{customer,
-orders}` is compared with the same join in the other plan wherever it sits.
+Suggested GUI colouring: matched nodes with `same_operator` true in one
+colour, matched nodes with a method difference in another, and
+`unmatched_postgres` / `unmatched_ai` nodes in a third.
 
 ## Limitations
 
-- Conditions are normalised (`normalize_condition`) but not used in the
-  difference rate, because LLM predicate text varies too much to score
-  reliably.
-- AI row and cost estimates are not based on PostgreSQL statistics. They are
-  shown side by side for information only.
-- Self-joins of the same table are matched by relation name, so two scans of
-  one table are compared as a group.
+- Matching is greedy, not globally optimal. It works well for typical QEP
+  shapes but can pair nodes sub-optimally when many operators share the same
+  tables.
+- Conditions are compared as normalised text, not semantically, so
+  equivalent predicates written in different ways (e.g. `BETWEEN` vs two
+  comparisons) are reported as different.
+- AI row and cost estimates are not based on PostgreSQL statistics and are
+  listed for information only; they are not treated as differences.
+- Operator names an LLM invents outside the synonym list are compared as-is
+  and will show up as missing/additional operations.
