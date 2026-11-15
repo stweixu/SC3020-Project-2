@@ -33,7 +33,10 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from src.plan_node import PlanNode
+if __package__:
+    from .preprocessing import PlanNode, parse_ai_plan, parse_postgres_plan
+else:
+    from preprocessing import PlanNode, parse_ai_plan, parse_postgres_plan
 
 
 # ---------------------------------------------------------------------------
@@ -409,14 +412,8 @@ def _coerce_plan(plan, source):
         return plan
     if plan is None:
         raise ValueError(f"{source} plan is missing.")
-    # Lazy import: preprocessing pulls in psycopg and the Gemini SDK, which
-    # are not needed when PlanNode trees are passed in.
     if source == "PostgreSQL":
-        from src.preprocessing import parse_postgres_plan
-
         return parse_postgres_plan(plan)
-    from src.preprocessing import parse_ai_plan
-
     return parse_ai_plan(plan)
 
 

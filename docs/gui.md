@@ -24,6 +24,10 @@ python src/project.py
 does not need an API key. Database settings come from `.env`; restart the app
 after editing them. The connection's database and host are shown above the editor.
 
+For a standalone folder containing the four application files, launch
+`python project.py` and place `.env` in that folder. Existing environment variables
+take precedence. File lookup does not depend on the terminal's current directory.
+
 1. Enter SQL and click **Fetch / compare plans** (Ctrl+Enter or Cmd+Enter).
 2. Inspect the tree using the scrollbars and zoom controls. Child order is
    preserved; the root is at the top. Middle-button dragging pans a tree.

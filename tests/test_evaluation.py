@@ -7,7 +7,7 @@ import pytest
 
 from collect_plans import collect_record, write_json
 from evaluate_plans import evaluate_pair, evaluate_run, load_run
-from src.plan_node import PlanNode
+from src.preprocessing import PlanNode
 from src.project import load_saved_comparison
 
 

@@ -5,7 +5,7 @@ import json
 import pytest
 
 from collect_plans import collect_batch, collect_record, restore_plan
-from src.plan_node import PlanNode
+from src.preprocessing import PlanNode
 
 
 QUERY = {"id": "Q01", "category": "selection", "sql": "SELECT 1;"}

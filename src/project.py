@@ -2,18 +2,22 @@
 
 from pathlib import Path
 import json
-import sys
 
-# Support both `python src/project.py` and `python -m src.project`.
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from src.comparison import DIFFERENCE_RATE_VERSION, classify_comparison, compare_plans
-from src.interface import display_comparison
-from src.preprocessing import (
-    AIPlanError, get_ai_plan, get_database_context, get_postgres_plan,
-    parse_ai_plan, parse_postgres_plan,
-)
+# Relative imports support package mode; sibling imports support a four-file copy.
+if __package__:
+    from .comparison import DIFFERENCE_RATE_VERSION, classify_comparison, compare_plans
+    from .interface import ComparisonApp, display_comparison
+    from .preprocessing import (
+        AIPlanError, DB_CONFIG, get_ai_plan, get_database_context, get_postgres_plan,
+        parse_ai_plan, parse_postgres_plan,
+    )
+else:
+    from comparison import DIFFERENCE_RATE_VERSION, classify_comparison, compare_plans
+    from interface import ComparisonApp, display_comparison
+    from preprocessing import (
+        AIPlanError, DB_CONFIG, get_ai_plan, get_database_context, get_postgres_plan,
+        parse_ai_plan, parse_postgres_plan,
+    )
 
 
 def run_query(sql, schema=None, *, display=True, mode="both"):
@@ -89,9 +93,6 @@ def load_saved_comparison(path):
 def main():
     """Launch the GUI; live retrieval runs on its background worker."""
     import tkinter as tk
-
-    from config.config import DB_CONFIG
-    from src.interface import ComparisonApp
 
     connection = (
         f"Database: {DB_CONFIG.get('dbname') or '(not configured)'}  |  "

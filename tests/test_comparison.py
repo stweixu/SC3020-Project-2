@@ -10,7 +10,7 @@ from src.comparison import (
     normalize_plan,
     tree_edit_distance,
 )
-from src.plan_node import PlanNode
+from src.preprocessing import PlanNode
 
 
 def pg_scan(relation, node_type="Seq Scan", rows=1000, **extra):

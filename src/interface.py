@@ -10,8 +10,12 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from src.plan_node import PlanNode
-from src.comparison import classify_comparison
+if __package__:
+    from .preprocessing import PlanNode
+    from .comparison import classify_comparison
+else:
+    from preprocessing import PlanNode
+    from comparison import classify_comparison
 
 
 STATUS_STYLES = {

@@ -10,8 +10,7 @@ import psycopg
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.config import DB_CONFIG
-from src.preprocessing import parse_postgres_plan
+from src.preprocessing import DB_CONFIG, parse_postgres_plan
 
 
 QUERY_DIR = Path(__file__).resolve().parent / "queries"

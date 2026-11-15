@@ -76,6 +76,22 @@ without another database/API request.
 See [docs/gui.md](docs/gui.md) for controls, the comparison-result
 format, verification steps, limitations, and development acknowledgement.
 
+## Four-file submission
+
+The application now consists of exactly four Python modules in `src/`:
+`project.py`, `interface.py`, `comparison.py`, and `preprocessing.py`.
+`PlanNode` and configuration loading are defined in `preprocessing.py`; no
+`plan_node.py` or `config/config.py` is required.
+
+These four files can be copied together into a standalone submission folder and
+launched there with `python project.py`. Dependencies still need to be installed.
+Place the local `.env` alongside the four files. In the development repository,
+the existing root-level `.env` and `python src/project.py` continue to work.
+Environment variables override values from `.env`; restart after changing settings.
+
+See [docs/submission.md](docs/submission.md) for folder layout, Windows setup and
+verification steps. Windows execution still needs confirmation on Windows hardware.
+
 ## Evaluation query workload
 
 `tests/queries/` contains 20 custom TPC-H queries covering selections, joins,
@@ -127,10 +143,9 @@ The `data/` directory contains the eight TPC-H SF1 `.tbl` files, tracked with Gi
 ## Project Structure
 
 ```text
-config/       Database configuration
 database/     Schema and dataset loader
 data/         TPC-H SF1 data
-src/          Project source code
+src/          Four application modules; configuration and PlanNode in preprocessing.py
 tests/        Tests
 docs/         Project documentation
 ```

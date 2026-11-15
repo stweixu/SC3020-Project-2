@@ -1,23 +1,41 @@
-
-"""PostgreSQL and AI-generated QEP retrieval and parsing."""
-
-import json
-
-import psycopg
-
-from config.config import DB_CONFIG
-from src.plan_node import PlanNode
-
+"""Configuration, shared plan nodes, and PostgreSQL/AI input processing."""
 
 import json
 import os
 from collections.abc import Mapping
+from pathlib import Path
 
+import psycopg
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from src.plan_node import PlanNode
+
+# A standalone submission uses .env beside these four application files.
+# In the development repository, also support the existing root-level .env.
+APPLICATION_DIR = Path(__file__).resolve().parent
+ENV_PATH = APPLICATION_DIR / ".env"
+if (not ENV_PATH.is_file() and APPLICATION_DIR.name == "src"
+        and (APPLICATION_DIR.parent / "requirements.txt").is_file()):
+    ENV_PATH = APPLICATION_DIR.parent / ".env"
+load_dotenv(ENV_PATH, override=False)
+
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST"),
+    "port": int(os.getenv("DB_PORT", "5432")),
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD", ""),
+}
+
+
+class PlanNode:
+    """Common tree node produced by both parsers and consumed by comparison/UI."""
+
+    def __init__(self, node_type, properties=None, children=None):
+        self.node_type = node_type
+        self.properties = properties or {}
+        self.children = children or []
 
 
 DEFAULT_LLM_MODEL = "gemini-3.5-flash-lite"
@@ -220,7 +238,6 @@ def get_ai_plan(sql, schema):
     if not schema_text.strip():
         raise ValueError("schema must not be empty")
 
-    load_dotenv()
     api_key = os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise AIPlanError(

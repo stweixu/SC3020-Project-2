@@ -1,7 +1,7 @@
 """Live connection smoke test using the application's configured database."""
 
 import psycopg
-from config.config import DB_CONFIG
+from src.preprocessing import DB_CONFIG
 
 def test_database_connection():
     with psycopg.connect(**DB_CONFIG, connect_timeout=10) as conn:

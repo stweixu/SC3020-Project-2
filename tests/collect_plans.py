@@ -19,9 +19,9 @@ import psycopg
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.config import DB_CONFIG
-from src.plan_node import PlanNode
 from src.preprocessing import (
+    DB_CONFIG,
+    PlanNode,
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_RETRY_ATTEMPTS,
     DEFAULT_LLM_TIMEOUT_MS,

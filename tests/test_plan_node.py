@@ -1,4 +1,4 @@
-from src.plan_node import PlanNode
+from src.preprocessing import PlanNode
 
 # Create a leaf node
 scan = PlanNode(

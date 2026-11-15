@@ -7,7 +7,7 @@ import tkinter as tk
 import pytest
 
 from src.interface import ComparisonApp, adapt_comparison_result, demo_comparison, index_plan
-from src.plan_node import PlanNode
+from src.preprocessing import PlanNode
 from src import project
 from src.comparison import compare_plans
 

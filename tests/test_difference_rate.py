@@ -5,7 +5,7 @@ from copy import deepcopy
 import pytest
 
 from src.comparison import calculate_difference_rate, classify_comparison, compare_plans
-from src.plan_node import PlanNode
+from src.preprocessing import PlanNode
 
 
 def scan(table="products", operator="Seq Scan", **properties):

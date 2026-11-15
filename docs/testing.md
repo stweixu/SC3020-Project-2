@@ -127,6 +127,9 @@ family when interpreting claims about query diversity.
 ## Automated verification
 
 ```sh
+# Isolated four-file packaging checks; no database or API requests.
+python -m pytest tests/test_submission.py -q
+
 # Comparator, metric, GUI, collector and evaluator; no database/API requests.
 python -m pytest tests/test_comparison.py tests/test_difference_rate.py tests/test_interface.py tests/test_plan_collection.py tests/test_evaluation.py -q
 
@@ -149,6 +152,13 @@ Tk tests run on a graphical desktop and skip if no display is available. Windows
 must still be checked on Windows: launch `python src/project.py`, compare a real
 pair, select findings, zoom/scroll, load a saved result, and recover from a failed
 request. macOS tests do not establish Windows compatibility.
+
+`test_submission.py` copies only the four application modules into a temporary
+folder whose name contains spaces and runs from an unrelated working directory.
+It verifies shared class identity, raw plan parsing/comparison, a mocked live
+workflow, GUI entry-point launch, application-local `.env` lookup and environment
+overrides. The tests use dummy configuration and do not copy credentials. Installed
+dependencies are reused; this does not replace a fresh-install or Windows test.
 
 This workload and validator were prepared with assistance from OpenAI GPT-6 Astra
 through OpenCode. Include this use in the team's consolidated LLM acknowledgement.

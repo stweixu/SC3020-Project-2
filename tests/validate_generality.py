@@ -10,7 +10,7 @@ from psycopg import sql
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.config import DB_CONFIG
+from src.preprocessing import DB_CONFIG
 from src.comparison import calculate_difference_rate, compare_plans
 from src.interface import adapt_comparison_result, index_plan
 from src.preprocessing import get_database_context, parse_postgres_plan

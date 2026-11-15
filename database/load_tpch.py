@@ -20,7 +20,7 @@ TABLES = [
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.config import DB_CONFIG
+from src.preprocessing import DB_CONFIG
 
 for table in TABLES:
     file_path = DATA_DIR / f"{table}.tbl"

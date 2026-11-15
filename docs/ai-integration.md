@@ -8,7 +8,7 @@ Member 2's functions live in `src/preprocessing.py`:
   `PlanNode` tree.
 - `parse_ai_plan(raw_plan)` parses and validates JSON from the provider, then
   converts nested nodes into the project's existing `PlanNode` class.
-- The node format follows `src/plan_node.py`: `node_type`, `properties`, and
+- The node format is defined by `PlanNode` in `src/preprocessing.py`: `node_type`, `properties`, and
   `children`.
 
 The repository uses TPC-H SF1 on PostgreSQL 17. The schema is defined in
